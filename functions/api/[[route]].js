@@ -37,23 +37,44 @@ function cleanCustomer(b) {
   };
   return /^[6-9]\d{9}$/.test(c.phone) && c.name.length >= 2 ? c : null;
 }
+// New mobile number  -> a new customer row.
+// Existing number    -> the stored row is kept exactly as it is: nothing already saved is overwritten and no duplicate is made.
+//                       Only fields that are still blank (gender / DOB / branch) are filled in if the customer gives them later.
 const upsertCustomer = (env, c, now) => env.DB.prepare(
   `INSERT INTO customers (phone,name,gender,dob,branch,created_at,last_seen) VALUES (?1,?2,?3,?4,?5,?6,?6)
-   ON CONFLICT(phone) DO UPDATE SET name=?2, gender=COALESCE(NULLIF(?3,''),gender),
-   dob=COALESCE(NULLIF(?4,''),dob), branch=COALESCE(NULLIF(?5,''),branch), last_seen=?6`
+   ON CONFLICT(phone) DO UPDATE SET
+     gender=COALESCE(NULLIF(gender,''),NULLIF(?3,''),gender),
+     dob=COALESCE(NULLIF(dob,''),NULLIF(?4,''),dob),
+     branch=COALESCE(NULLIF(branch,''),NULLIF(?5,''),branch),
+     last_seen=?6`
 ).bind(c.phone, c.name, c.gender, c.dob, c.branch, now);
+
+// Live refresh: one counter that goes up on every change. The admin panel checks this single row every
+// couple of seconds and only downloads the full data when the number has changed.
+let metaReady = false;
+async function ensureMeta(env) {
+  if (metaReady) return;
+  await env.DB.prepare('CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL)').run();
+  metaReady = true;
+}
+const bump = env => env.DB.prepare("INSERT INTO meta (k,v) VALUES ('v',1) ON CONFLICT(k) DO UPDATE SET v=v+1");
 
 export async function onRequest({ request: req, env, params }) {
   const path = '/' + [].concat(params.route || []).join('/'), m = req.method;
   try {
     if (!env.DB) return json({ error: 'Database not connected (bind D1 as "DB")' }, 500);
+    await ensureMeta(env);
 
     // ---- public: called by the customer site ----
     if (m === 'POST' && path === '/customers') {
       const c = cleanCustomer(await body(req));
       if (!c) return json({ error: 'Invalid details' }, 400);
-      await upsertCustomer(env, c, new Date().toISOString()).run();
-      return json({ ok: true });
+      const [before] = await env.DB.batch([
+        env.DB.prepare('SELECT 1 AS x FROM customers WHERE phone=?').bind(c.phone),   // runs before the upsert below
+        upsertCustomer(env, c, new Date().toISOString()),
+        bump(env)
+      ]);
+      return json({ ok: true, existing: before.results.length > 0 });
     }
     if (m === 'POST' && path === '/orders') {
       const b = await body(req), c = cleanCustomer(b), cid = str(b.cid, 60);
@@ -67,10 +88,21 @@ export async function onRequest({ request: req, env, params }) {
         upsertCustomer(env, c, now),
         env.DB.prepare('INSERT OR IGNORE INTO orders (cid,ts,status,phone,name,branch,mode,pay,subtotal,total,items) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
           .bind(cid, now, 'New', c.phone, c.name, c.branch, b.mode === 'delivery' ? 'delivery' : 'dining',
-                PAYS.includes(b.pay) ? b.pay : 'cash', subtotal, t >= 0 && t <= 1e6 ? t : subtotal, JSON.stringify(items))
+                PAYS.includes(b.pay) ? b.pay : 'cash', subtotal, t >= 0 && t <= 1e6 ? t : subtotal, JSON.stringify(items)),
+        bump(env)
       ]);
       const r = await env.DB.prepare('SELECT seq FROM orders WHERE cid=?').bind(cid).first();   // same cid = same order, no duplicates
       return json({ ok: true, id: 'HS-' + (1000 + r.seq) });
+    }
+
+    // Customer site asks "what is the status of my orders?". Only the order number and status come back (no names, items or phone numbers),
+    // and an order can only be looked up by its long private id (cid) that only that customer's browser knows.
+    if (m === 'POST' && path === '/orders/status') {
+      const b = await body(req);
+      const cids = (Array.isArray(b.cids) ? b.cids : []).slice(0, 20).map(x => str(x, 60)).filter(Boolean);
+      if (!cids.length) return json({ orders: [] });
+      const r = await env.DB.prepare(`SELECT cid, seq, status FROM orders WHERE cid IN (${cids.map(() => '?').join(',')})`).bind(...cids).all();
+      return json({ orders: r.results.map(x => ({ cid: x.cid, id: 'HS-' + (1000 + x.seq), status: x.status })) });
     }
 
     // ---- admin ----
@@ -89,6 +121,10 @@ export async function onRequest({ request: req, env, params }) {
     }
     if (path.startsWith('/admin/')) {
       if (!(await isAdmin(env, req))) return json({ error: 'Unauthorized' }, 401);
+      if (m === 'GET' && path === '/admin/ping') {
+        const r = await env.DB.prepare("SELECT v FROM meta WHERE k='v'").first();
+        return json({ v: r ? r.v : 0 });
+      }
       if (m === 'GET' && path === '/admin/data') {
         const o = await env.DB.prepare('SELECT * FROM orders ORDER BY seq DESC LIMIT 2000').all();
         const c = await env.DB.prepare('SELECT * FROM customers ORDER BY last_seen DESC LIMIT 5000').all();
@@ -103,7 +139,10 @@ export async function onRequest({ request: req, env, params }) {
       if (m === 'PATCH' && st) {
         const s = (await body(req)).status;
         if (!STATUSES.includes(s)) return json({ error: 'Invalid request' }, 400);
-        const r = await env.DB.prepare('UPDATE orders SET status=? WHERE seq=?').bind(s, Number(st[1]) - 1000).run();
+        const [r] = await env.DB.batch([
+          env.DB.prepare('UPDATE orders SET status=? WHERE seq=?').bind(s, Number(st[1]) - 1000),
+          bump(env)
+        ]);
         return r.meta.changes ? json({ ok: true }) : json({ error: 'Order not found' }, 404);
       }
     }
