@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow">
+<title>Hungerr Station Admin</title>
+<style>
+:root{--red:#E23744;--line:#e8e8e8;--mut:#6b7280}
+*{box-sizing:border-box}[hidden]{display:none!important}
+body{margin:0;font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;color:#1c1c1c;background:#f8f8f8}
+button,input,select{font:inherit}
+.center{min-height:100vh;display:grid;place-items:center;padding:16px}
+.card{background:#fff;border:1px solid var(--line);border-radius:14px}
+.pad{padding:24px;width:100%;max-width:340px;display:grid;gap:12px}
+h1{margin:0;font-size:20px}h1 span,.red{color:var(--red)}
+input,select{border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:#fff;min-width:0}
+input:focus,select:focus{outline:2px solid #fbd3d6;border-color:var(--red)}
+.btn{background:var(--red);color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer}
+.btn.ghost{background:#fff;color:#1c1c1c;border:1px solid var(--line)}
+.err{color:var(--red);margin:0;min-height:1.2em;font-weight:600}
+.bar{display:flex;align-items:center;gap:10px;padding:12px 16px;background:#fff;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5;flex-wrap:wrap}
+.sp{flex:1}.mut{color:var(--mut);font-size:12px}
+.wrap{max-width:1250px;margin:0 auto;padding:16px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px}
+.stat{padding:14px}.stat small{display:block;color:var(--mut);font-weight:600}.stat b{font-size:24px}
+.tabs{display:flex;gap:6px;margin-bottom:10px}
+.tabs button{border:1px solid var(--line);background:#fff;border-radius:999px;padding:7px 16px;font-weight:700;cursor:pointer}
+.tabs .on{background:#1c1c1c;color:#fff;border-color:#1c1c1c}
+.tools{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}.tools input{flex:1;min-width:200px}
+.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;min-width:900px}
+th{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--mut);text-align:left;background:#fafafa}
+th,td{padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+tr.new td{background:#fff8f8}.items div{white-space:nowrap}
+.st{font-weight:700;border-radius:8px}.st-New{background:#fff3cd}.st-Preparing{background:#dbeafe}.st-Completed{background:#dcfce7}.st-Cancelled{background:#e5e7eb}
+td.empty{text-align:center;color:var(--mut);padding:30px}
+</style></head><body>
+<div id="login" class="center"><form class="card pad" onsubmit="return doLogin(event)">
+ <h1>Hungerr Station <span>Admin</span></h1>
+ <input id="pw" type="password" placeholder="Admin password" autocomplete="current-password" required>
+ <p id="lerr" class="err" role="alert"></p><button class="btn">Login</button>
+</form></div>
+
+<div id="app" hidden>
+ <header class="bar"><b>Hungerr Station <span class="red">Admin</span></b><span class="sp"></span><span id="upd" class="mut"></span>
+  <button class="btn ghost" onclick="load()">Refresh</button><button class="btn ghost" onclick="logout()">Logout</button></header>
+ <main class="wrap">
+  <section id="stats" class="stats"></section>
+  <nav class="tabs"><button id="t-orders" class="on" onclick="tab('orders')">Orders</button><button id="t-customers" onclick="tab('customers')">Customers</button></nav>
+  <div class="tools">
+   <input id="q" placeholder="Search name, mobile or order ID" oninput="draw()">
+   <select id="fb" onchange="draw()"><option value="">All branches</option><option value="manpura">Borkheda, Kota</option><option value="rang">Umed Bhawan Palace, Kota</option></select>
+   <select id="fs" onchange="draw()"><option value="">All statuses</option><option>New</option><option>Preparing</option><option>Completed</option><option>Cancelled</option></select>
+  </div>
+  <div class="card scroll"><table id="tbl"></table></div>
+ </main>
+</div>
+
+<script>
+const BR={manpura:'Borkheda, Kota',rang:'Umed Bhawan Palace, Kota'},PAY={cash:'Cash',paytm:'Paytm',gpay:'Google Pay',phonepe:'PhonePe'},ST=['New','Preparing','Completed','Cancelled'];
+let tok=sessionStorage.getItem('hs_admin'),D={orders:[],customers:[]},view='orders',timer;
+const $=id=>document.getElementById(id);
+const h=(t,c,...k)=>{const e=document.createElement(t);if(c)e.className=c;e.append(...k);return e};   // text only, never innerHTML
+const td=(...k)=>h('td','',...k),inr=n=>'\u20B9'+Number(n).toLocaleString('en-IN');
+const when=s=>s?new Date(s).toLocaleString('en-IN',{dateStyle:'medium',timeStyle:'short'}):'-';
+async function api(p,o={}){const r=await fetch(p,{...o,headers:{'Content-Type':'application/json',...(tok?{Authorization:'Bearer '+tok}:{})}});
+ if(r.status===401&&tok){logout();throw new Error('Session expired. Please log in again.')}
+ const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||'Request failed');return d}
+async function doLogin(e){e.preventDefault();$('lerr').textContent='';
+ try{tok=null;const d=await api('/api/admin/login',{method:'POST',body:JSON.stringify({password:$('pw').value})});tok=d.token;sessionStorage.setItem('hs_admin',tok);$('pw').value='';start()}
+ catch(x){$('lerr').textContent=x.message}return false}
+function logout(){tok=null;sessionStorage.removeItem('hs_admin');clearInterval(timer);$('app').hidden=true;$('login').hidden=false}
+function start(){$('login').hidden=true;$('app').hidden=false;load();clearInterval(timer);timer=setInterval(load,20000)}
+async function load(){try{D=await api('/api/admin/data');$('upd').textContent='Updated '+new Date().toLocaleTimeString('en-IN',{timeStyle:'short'});draw()}catch(x){$('upd').textContent=x.message}}
+function stats(){const t=new Date().toDateString(),live=D.orders.filter(o=>o.status!=='Cancelled'),td_=live.filter(o=>new Date(o.ts).toDateString()===t);
+ const S=[['Orders today',td_.length],['Revenue today',inr(td_.reduce((a,o)=>a+o.total,0))],['New orders',D.orders.filter(o=>o.status==='New').length],['Customers',D.customers.length]];
+ $('stats').replaceChildren(...S.map(([l,v])=>h('div','card stat',h('small','',l),h('b','',String(v)))))}
+function tab(v){view=v;$('t-orders').className=v==='orders'?'on':'';$('t-customers').className=v==='customers'?'on':'';$('fs').hidden=v!=='orders';draw()}
+const head=(...c)=>{const r=h('tr');r.append(...c.map(x=>h('th','',x)));return r};
+const empty=n=>{const r=h('tr'),d=h('td','empty','Nothing here yet');d.colSpan=n;r.append(d);return r};
+function orderRow(o){const tr=h('tr',o.status==='New'?'new':''),sel=h('select','st st-'+o.status);
+ ST.forEach(s=>{const op=h('option','',s);op.value=s;op.selected=s===o.status;sel.append(op)});
+ sel.onchange=async()=>{try{await api('/api/admin/orders/'+encodeURIComponent(o.id)+'/status',{method:'PATCH',body:JSON.stringify({status:sel.value})});o.status=sel.value;draw()}catch(x){alert(x.message);load()}};
+ const items=h('td','items');o.items.forEach(i=>items.append(h('div','',i.name+' \u2013 '+inr(i.price))));
+ tr.append(td(h('b','',o.id)),td(when(o.ts)),td(h('b','',o.name),h('div','mut','+91 '+o.phone)),td(BR[o.branch]||o.branch||'-'),items,td(o.mode==='delivery'?'Delivery':'Dining / Takeaway'),td(PAY[o.pay]||o.pay),td(h('b','',inr(o.total))),td(sel));return tr}
+function draw(){stats();const q=$('q').value.trim().toLowerCase(),fb=$('fb').value,fs=$('fs').value,hit=(...a)=>!q||a.join(' ').toLowerCase().includes(q),T=$('tbl');
+ if(view==='orders'){const L=D.orders.filter(o=>(!fb||o.branch===fb)&&(!fs||o.status===fs)&&hit(o.id,o.name,o.phone));
+  T.replaceChildren(head('Order','Time','Customer','Branch','Items','Type','Payment','Total','Status'),...(L.length?L.map(orderRow):[empty(9)]));return}
+ const agg={};D.orders.filter(o=>o.status!=='Cancelled').forEach(o=>{const a=agg[o.phone]||(agg[o.phone]={n:0,s:0});a.n++;a.s+=o.total});
+ const L=D.customers.filter(c=>(!fb||c.branch===fb)&&hit(c.name,c.phone)).sort((a,b)=>(b.lastSeen||'').localeCompare(a.lastSeen||''));
+ T.replaceChildren(head('Name','Mobile','Gender','Date of birth','Branch','Orders','Total spent','Joined','Last seen'),...(L.length?L.map(c=>{const a=agg[c.phone]||{n:0,s:0},tr=h('tr');
+  tr.append(td(h('b','',c.name)),td('+91 '+c.phone),td(c.gender||'-'),td(c.dob?new Date(c.dob+'T00:00').toLocaleDateString('en-IN',{dateStyle:'medium'}):'-'),td(BR[c.branch]||c.branch||'-'),td(String(a.n)),td(inr(a.s)),td(when(c.createdAt)),td(when(c.lastSeen)));return tr}):[empty(9)]))}
+if(tok)start();
+</script></body></html>
