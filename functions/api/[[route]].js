@@ -55,11 +55,65 @@ let metaReady = false;
 async function ensureMeta(env) {
   if (metaReady) return;
   await env.DB.prepare('CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL)').run();
+  await env.DB.prepare('CREATE TABLE IF NOT EXISTS push_subs (endpoint TEXT PRIMARY KEY, p256dh TEXT NOT NULL, auth TEXT NOT NULL, ts INTEGER NOT NULL)').run();
   metaReady = true;
 }
 const bump = env => env.DB.prepare("INSERT INTO meta (k,v) VALUES ('v',1) ON CONFLICT(k) DO UPDATE SET v=v+1");
 
-export async function onRequest({ request: req, env, params }) {
+// ---- Web Push: alerts on the admin's phone even when the panel is closed ----
+// Needs two secrets (made once with:  npx web-push generate-vapid-keys):  VAPID_PUBLIC  and  VAPID_PRIVATE
+const b64u = {
+  enc: b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''),
+  dec: s => Uint8Array.from(atob(String(s).replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0))
+};
+const cat = (...a) => { const o = new Uint8Array(a.reduce((n, x) => n + x.length, 0)); let p = 0; for (const x of a) { o.set(x, p); p += x.length; } return o; };
+async function vapidJwt(env, aud) {
+  const pub = b64u.dec(env.VAPID_PUBLIC);
+  const key = await crypto.subtle.importKey('jwk',
+    { kty: 'EC', crv: 'P-256', x: b64u.enc(pub.slice(1, 33)), y: b64u.enc(pub.slice(33, 65)), d: env.VAPID_PRIVATE, ext: true },
+    { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+  const h = b64u.enc(enc.encode(JSON.stringify({ typ: 'JWT', alg: 'ES256' })));
+  const c = b64u.enc(enc.encode(JSON.stringify({ aud, exp: Math.floor(Date.now() / 1000) + 12 * 3600, sub: env.VAPID_SUBJECT || 'https://hungerrstation.pages.dev' })));
+  const sig = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, enc.encode(h + '.' + c));
+  return h + '.' + c + '.' + b64u.enc(sig);
+}
+async function encryptPush(sub, text) {   // RFC 8291 (aes128gcm)
+  const ua = b64u.dec(sub.p256dh), authSecret = b64u.dec(sub.auth);
+  const eph = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+  const asPub = new Uint8Array(await crypto.subtle.exportKey('raw', eph.publicKey));
+  const uaKey = await crypto.subtle.importKey('raw', ua, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+  const secret = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: uaKey }, eph.privateKey, 256));
+  const hk = async (salt, ikm, info, len) => new Uint8Array(await crypto.subtle.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt, info }, await crypto.subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']), len * 8));
+  const ikm = await hk(authSecret, secret, cat(enc.encode('WebPush: info\0'), ua, asPub), 32);
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const cek = await hk(salt, ikm, enc.encode('Content-Encoding: aes128gcm\0'), 16);
+  const nonce = await hk(salt, ikm, enc.encode('Content-Encoding: nonce\0'), 12);
+  const aes = await crypto.subtle.importKey('raw', cek, 'AES-GCM', false, ['encrypt']);
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce }, aes, cat(enc.encode(text), new Uint8Array([2]))));
+  return cat(salt, new Uint8Array([0, 0, 16, 0, 65]), asPub, ct);
+}
+async function pushAll(env, payload) {
+  if (!env.VAPID_PUBLIC || !env.VAPID_PRIVATE) return;
+  try {
+    const subs = (await env.DB.prepare('SELECT endpoint,p256dh,auth FROM push_subs').all()).results, text = JSON.stringify(payload);
+    await Promise.all(subs.map(async s => {
+      try {
+        const jwt = await vapidJwt(env, new URL(s.endpoint).origin);
+        const r = await fetch(s.endpoint, {
+          method: 'POST',
+          headers: { 'Content-Encoding': 'aes128gcm', 'Content-Type': 'application/octet-stream', TTL: '86400', Urgency: 'high',
+                     Authorization: 'vapid t=' + jwt + ', k=' + env.VAPID_PUBLIC },
+          body: await encryptPush(s, text)
+        });
+        if (r.status === 404 || r.status === 410) await env.DB.prepare('DELETE FROM push_subs WHERE endpoint=?').bind(s.endpoint).run();   // phone uninstalled / revoked
+      } catch (e) {}
+    }));
+  } catch (e) {}
+}
+// ---- end Web Push ----
+
+export async function onRequest({ request: req, env, params, waitUntil }) {
   const path = '/' + [].concat(params.route || []).join('/'), m = req.method;
   try {
     if (!env.DB) return json({ error: 'Database not connected (bind D1 as "DB")' }, 500);
@@ -84,7 +138,7 @@ export async function onRequest({ request: req, env, params }) {
       if (!c || !cid || !items.length || items.some(i => !i.name || !(i.price >= 0 && i.price <= 100000)))
         return json({ error: 'Invalid order' }, 400);
       const now = new Date().toISOString(), subtotal = items.reduce((a, i) => a + i.price, 0), t = Math.round(Number(b.total));
-      await env.DB.batch([
+      const res = await env.DB.batch([
         upsertCustomer(env, c, now),
         env.DB.prepare('INSERT OR IGNORE INTO orders (cid,ts,status,phone,name,branch,mode,pay,subtotal,total,items) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
           .bind(cid, now, 'New', c.phone, c.name, c.branch, b.mode === 'delivery' ? 'delivery' : 'dining',
@@ -92,6 +146,9 @@ export async function onRequest({ request: req, env, params }) {
         bump(env)
       ]);
       const r = await env.DB.prepare('SELECT seq FROM orders WHERE cid=?').bind(cid).first();   // same cid = same order, no duplicates
+      if (res[1].meta.changes > 0 && waitUntil)   // only a genuinely new order alerts the admin (retries of the same order do not)
+        waitUntil(pushAll(env, { kind: 'new', tag: 'new-' + r.seq, title: 'New order HS-' + (1000 + r.seq),
+          body: c.name + ' \u00B7 \u20B9' + (t >= 0 && t <= 1e6 ? t : subtotal) + ' \u00B7 ' + items.length + ' item' + (items.length > 1 ? 's' : '') + ' \u00B7 ' + (b.mode === 'delivery' ? 'Delivery' : 'Dining / Takeaway') }));
       return json({ ok: true, id: 'HS-' + (1000 + r.seq) });
     }
 
@@ -121,6 +178,19 @@ export async function onRequest({ request: req, env, params }) {
     }
     if (path.startsWith('/admin/')) {
       if (!(await isAdmin(env, req))) return json({ error: 'Unauthorized' }, 401);
+      if (m === 'GET' && path === '/admin/push-key') return json({ key: env.VAPID_PUBLIC && env.VAPID_PRIVATE ? env.VAPID_PUBLIC : '' });
+      if (m === 'POST' && path === '/admin/push/subscribe') {
+        const b = await body(req), k = b.keys || {};
+        if (typeof b.endpoint !== 'string' || !/^https:\/\//.test(b.endpoint) || b.endpoint.length > 600 || typeof k.p256dh !== 'string' || typeof k.auth !== 'string')
+          return json({ error: 'Invalid subscription' }, 400);
+        await env.DB.prepare('INSERT INTO push_subs (endpoint,p256dh,auth,ts) VALUES (?1,?2,?3,?4) ON CONFLICT(endpoint) DO UPDATE SET p256dh=?2,auth=?3,ts=?4')
+          .bind(b.endpoint, k.p256dh.slice(0, 200), k.auth.slice(0, 100), Date.now()).run();
+        return json({ ok: true });
+      }
+      if (m === 'POST' && path === '/admin/push/unsubscribe') {
+        await env.DB.prepare('DELETE FROM push_subs WHERE endpoint=?').bind(str((await body(req)).endpoint, 600)).run();
+        return json({ ok: true });
+      }
       if (m === 'GET' && path === '/admin/ping') {
         const r = await env.DB.prepare("SELECT v FROM meta WHERE k='v'").first();
         return json({ v: r ? r.v : 0 });
@@ -143,7 +213,12 @@ export async function onRequest({ request: req, env, params }) {
           env.DB.prepare('UPDATE orders SET status=? WHERE seq=?').bind(s, Number(st[1]) - 1000),
           bump(env)
         ]);
-        return r.meta.changes ? json({ ok: true }) : json({ error: 'Order not found' }, 404);
+        if (!r.meta.changes) return json({ error: 'Order not found' }, 404);
+        if (waitUntil) {
+          const o = await env.DB.prepare('SELECT name,total FROM orders WHERE seq=?').bind(Number(st[1]) - 1000).first();
+          if (o) waitUntil(pushAll(env, { kind: 'status', tag: 'st-' + st[1], title: 'Order HS-' + st[1] + ' \u2192 ' + s, body: o.name + ' \u00B7 \u20B9' + o.total }));
+        }
+        return json({ ok: true });
       }
     }
     return json({ error: 'Not found' }, 404);
